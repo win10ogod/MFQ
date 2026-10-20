@@ -4,6 +4,7 @@ from __future__ import annotations
 
 import copy
 import json
+import os
 import re
 from pathlib import Path
 
@@ -26,8 +27,21 @@ RELEASED_MIXER_PATTERN = (
     "MEMAEMEMEMEMEMAEMEMEMEMEMAEMEMEMEMAEMEMEMEME"
 )
 
-RELEASED_CONFIG_PATH = Path("/mnt/f/MFQ-nemotron-work/config.json")
-RELEASED_PATTERNS_PATH = Path("/mnt/f/MFQ-nemotron-work/tensor_patterns.txt")
+# Point MFQ_NEMOTRON_HF_DIR at a released omni checkpoint to check the contract
+# against its real config.json and model.safetensors.index.json.
+RELEASED_CHECKPOINT_ENV = "MFQ_NEMOTRON_HF_DIR"
+
+
+def released_checkpoint_file(name: str) -> Path:
+    """Return one file of the released checkpoint, or skip when it is absent."""
+
+    root = os.environ.get(RELEASED_CHECKPOINT_ENV)
+    if not root:
+        pytest.skip(f"{RELEASED_CHECKPOINT_ENV} is not set")
+    path = Path(root) / name
+    if not path.is_file():
+        pytest.skip(f"released Nemotron-H {name} is not available")
+    return path
 
 
 def released_config() -> dict[str, object]:
@@ -204,9 +218,7 @@ def test_infinite_time_step_limit_uses_the_serialized_float_form() -> None:
 
 
 def test_released_checkpoint_parses_when_present() -> None:
-    if not RELEASED_CONFIG_PATH.is_file():
-        pytest.skip("released Nemotron-H config is not available")
-    raw = json.loads(RELEASED_CONFIG_PATH.read_text(encoding="utf-8"))
+    raw = json.loads(released_checkpoint_file("config.json").read_text(encoding="utf-8"))
     contract = NemotronHConfig.from_hf_config(raw)
     assert contract.num_hidden_layers == 88
     assert contract.mamba_in_projection_width == 18560
@@ -569,14 +581,9 @@ def _normalized_pattern(name: str) -> str:
 def test_released_pattern_table_covers_the_whole_tensor_index() -> None:
     """Every pattern of the released index must appear in the mapping table."""
 
-    if not RELEASED_PATTERNS_PATH.is_file():
-        pytest.skip("released Nemotron-H tensor index is not available")
-    expected = set()
-    for line in RELEASED_PATTERNS_PATH.read_text(encoding="utf-8").splitlines():
-        parts = line.split()
-        if len(parts) != 2 or not parts[0].isdigit():
-            break
-        expected.add(_normalized_pattern(parts[1]))
+    index_path = released_checkpoint_file("model.safetensors.index.json")
+    weight_map = json.loads(index_path.read_text(encoding="utf-8"))["weight_map"]
+    expected = {_normalized_pattern(name) for name in weight_map}
     covered = {_normalized_pattern(source) for source, _canonical, _ in RELEASED_TENSOR_PATTERNS}
     assert covered == expected
 
