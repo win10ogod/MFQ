@@ -508,6 +508,38 @@ void check_latent_moe(tb::ScalarType dtype, float tolerance) {
     require(rejected, "ungated routed MoE silently accepted a gate projection");
 }
 
+// A long prompt must not gather every route's whole expert matrix at once:
+// row chunks bounded by the gather budget give the same projection.
+void check_dense_routed_chunking() {
+    const int64_t experts = 9, output = 6, width = 5, rows = 11, routes = 3;
+    auto bank = upload(pattern(static_cast<std::size_t>(experts * output * width), 0.4f, 3.0f),
+                       {experts, output, width}, tb::kFloat32);
+    std::vector<float> ids_values(static_cast<std::size_t>(rows * routes));
+    for (std::size_t i = 0; i < ids_values.size(); ++i)
+        ids_values[i] = static_cast<float>((i * 5 + i / 3) % static_cast<std::size_t>(experts));
+    auto ids = upload(ids_values, {rows, routes}, tb::kFloat32).to(tb::kInt64);
+    auto flat = upload(pattern(static_cast<std::size_t>(rows * width), 0.6f, 7.0f), {rows, width},
+                       tb::kFloat32);
+    auto routed = upload(pattern(static_cast<std::size_t>(rows * routes * width), 0.5f, 11.0f),
+                         {rows, routes, width}, tb::kFloat32);
+    const std::size_t row_bytes = static_cast<std::size_t>(routes * output * width) * sizeof(float);
+    const std::size_t unbounded = std::numeric_limits<std::size_t>::max();
+    for (const auto& input : {flat, routed}) {
+        const auto whole = host_values(dense_routed_projection(bank, input, ids, unbounded));
+        // Four rows per chunk leaves a three-row remainder.
+        const auto chunked = host_values(dense_routed_projection(bank, input, ids, 4 * row_bytes));
+        const auto single = host_values(dense_routed_projection(bank, input, ids, 1));
+        require(whole.size() == static_cast<std::size_t>(rows * routes * output),
+                "dense routed projection returned the wrong shape");
+        const std::vector<double> expected(whole.begin(), whole.end());
+        const double chunk_difference = max_difference(chunked, expected);
+        const double single_difference = max_difference(single, expected);
+        require(chunk_difference <= 1e-6 && single_difference <= 1e-6,
+                "chunked dense routed projection differs: " + std::to_string(chunk_difference) +
+                    " / " + std::to_string(single_difference));
+    }
+}
+
 std::vector<int64_t> reference_topk(const std::vector<float>& logits, const std::vector<float>& bias,
                                     int top_k) {
     const int experts = static_cast<int>(bias.size());
@@ -564,6 +596,7 @@ int main() {
         check_latent_moe(tb::kFloat16, 3e-3f);
         check_latent_moe(tb::kBFloat16, 3e-2f);
         check_latent_removal_detected();
+        check_dense_routed_chunking();
         check_topk_512();
         std::cout << "NoPE attention and latent MoE checks PASS\n";
         return 0;
